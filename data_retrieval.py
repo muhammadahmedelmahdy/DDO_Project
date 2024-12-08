@@ -32,6 +32,9 @@ class DataGenerationModule:
             columns=["Unnamed: 0"], inplace=True, errors="ignore"
         )
 
+        self.all_waybill_df["grab_time"] = pd.to_datetime(
+            self.all_waybill_df["grab_time"], unit="s"
+        )
         # Convert string representations of lists to Python lists
         if "order_ids" in self.courier_wave_df.columns:
             self.courier_wave_df["order_ids"] = self.courier_wave_df["order_ids"].apply(
@@ -47,8 +50,6 @@ class DataGenerationModule:
             "wave_start_time",
             "wave_end_time",
             "dispatch_time",
-            "grab_time",
-            "fetch_time",
             "arrive_time",
         ]
         for col in time_columns:
@@ -61,30 +62,18 @@ class DataGenerationModule:
                     self.courier_wave_df[col], unit="s"
                 )
 
-    def get_active_orders(self, start_time, end_time):
+    def get_active_orders(self, timestamp):
         """
-        Retrieve active orders within the given time window.
-        Active orders are:
-        - Dispatched within the time window.
-        - Arrival time is after the end of the time window.
+        Retrieve active orders at the given timestamp.
         """
-        # Convert start and end times to datetime
-        start_time = pd.to_datetime(start_time, unit="s")
-        end_time = pd.to_datetime(end_time, unit="s")
-
-        # Filter orders based on dispatch and arrival times
+        timestamp = pd.to_datetime(timestamp, unit="s")
         active_orders = self.all_waybill_df[
-            (self.all_waybill_df["dispatch_time"] >= start_time)
-            & (self.all_waybill_df["dispatch_time"] <= end_time)
-            & (self.all_waybill_df["arrive_time"] > end_time)
+            (self.all_waybill_df["dispatch_time"] <= timestamp)
+            & (self.all_waybill_df["arrive_time"] > timestamp)
         ]
-
-        # Return only relevant columns for orders
         return active_orders[
             [
                 "order_id",
-                "dispatch_time",
-                "arrive_time",
                 "sender_lat",
                 "sender_lng",
                 "recipient_lat",
@@ -92,40 +81,93 @@ class DataGenerationModule:
             ]
         ]
 
-    def get_active_couriers(self, start_time, end_time):
+    def get_active_couriers(self, timestamp):
         """
-        Retrieve active couriers within the given time window.
-        Active couriers are:
-        - Those whose wave times overlap with the specified time window.
+        Retrieve active couriers at the given timestamp.
         """
-        # Convert start and end times to datetime
-        start_time = pd.to_datetime(start_time, unit="s")
-        end_time = pd.to_datetime(end_time, unit="s")
-
-        # Filter couriers based on wave start and end times
+        timestamp = pd.to_datetime(timestamp, unit="s")
         active_couriers = self.courier_wave_df[
-            (self.courier_wave_df["wave_start_time"] <= end_time)
-            & (self.courier_wave_df["wave_end_time"] >= start_time)
+            (self.courier_wave_df["wave_start_time"] <= timestamp)
+            & (self.courier_wave_df["wave_end_time"] >= timestamp)
         ]
-
-        # Return only relevant columns for couriers
+        # Retrieve the most recent location of each courier from all_waybill_df
+        courier_locations = (
+            self.all_waybill_df[self.all_waybill_df["grab_time"] <= timestamp]
+            .sort_values(by="grab_time", ascending=False)
+            .drop_duplicates(subset=["courier_id"])[
+                ["courier_id", "grab_lat", "grab_lng"]
+            ]
+        )
+        # Merge active couriers with locations
+        active_couriers = active_couriers.merge(
+            courier_locations, on="courier_id", how="left"
+        )
+        # Fill missing locations and details with default values
+        active_couriers["grab_lat"].fillna(0, inplace=True)
+        active_couriers["grab_lng"].fillna(0, inplace=True)
+        active_couriers["wave_id"].fillna(-1, inplace=True)
+        active_couriers["order_ids"].fillna("[]", inplace=True)
+        # Add this at the end of the get_active_couriers method
+        active_couriers["unfulfilled_orders"] = 0  # Initialize with 0
         return active_couriers[
-            ["courier_id", "wave_id", "wave_start_time", "wave_end_time", "order_ids"]
+            [
+                "courier_id",
+                "wave_id",
+                "order_ids",
+                "grab_lat",
+                "grab_lng",
+                "unfulfilled_orders",
+            ]
         ]
 
-    def construct_state(self, start_time, end_time):
+        # return active_couriers[
+        #     ["courier_id", "wave_id", "order_ids", "grab_lat", "grab_lng"]
+        # ]
+
+    def get_unfulfilled_orders(self, courier_order_ids, timestamp):
         """
-        Construct the RL environment state for the given time window.
-        The state includes active orders, active couriers, and system statistics.
+        Retrieve the number of unfulfilled orders for a courier before the given timestamp.
         """
-        # Get active orders and couriers
-        active_orders = self.get_active_orders(start_time, end_time)
-        active_couriers = self.get_active_couriers(start_time, end_time)
+        if not courier_order_ids:  # Handle case where no orders are assigned
+            return 0
+
+        timestamp = pd.to_datetime(timestamp, unit="s")
+
+        # Filter orders assigned to the courier
+        unfulfilled_orders = self.all_waybill_df[
+            (self.all_waybill_df["order_id"].isin(courier_order_ids))
+            & (self.all_waybill_df["arrive_time"] > timestamp)
+        ]
+
+        # Return the count of unfulfilled orders
+        return len(unfulfilled_orders)
+
+    def construct_state(self, timestamp):
+        """
+        Construct the RL environment state at the given timestamp.
+        """
+        # Get active orders
+        active_orders = self.get_active_orders(timestamp)
+
+        # Get active couriers and count their unfulfilled orders
+        active_couriers = self.get_active_couriers(timestamp)
+        courier_details = []
+        for _, row in active_couriers.iterrows():
+            unfulfilled_count = self.get_unfulfilled_orders(row["order_ids"], timestamp)
+            courier_details.append(
+                {
+                    "courier_id": row["courier_id"],
+                    "wave_id": row["wave_id"],
+                    "grab_lat": row["grab_lat"],
+                    "grab_lng": row["grab_lng"],
+                    "unfulfilled_orders": unfulfilled_count,
+                }
+            )
 
         # Construct state dictionary
         state = {
             "orders": active_orders.to_dict(orient="records"),
-            "couriers": active_couriers.to_dict(orient="records"),
+            "couriers": courier_details,
             "system": {
                 "active_orders": len(active_orders),
                 "active_couriers": len(active_couriers),
@@ -150,22 +192,13 @@ if __name__ == "__main__":
         dispatch_waybill_path,
     )
 
-    # Define the time window
-    start_time = 1666077600  # Example start timestamp (Unix time)
-    end_time = 1666077900  # Example end timestamp (Unix time)
-
-    # Retrieve active orders and couriers
-    active_orders = data_module.get_active_orders(start_time, end_time)
-    active_couriers = data_module.get_active_couriers(start_time, end_time)
-
-    print("Active Orders:")
-    print(active_orders)
-    print("\nActive Couriers:")
-    print(active_couriers)
+    # Define the timestamp
+    timestamp = 1666077600  # Example timestamp (Unix time)
 
     # Construct state and save to JSON
-    state = data_module.construct_state(start_time, end_time)
+    state = data_module.construct_state(timestamp)
     with open("state.json", "w") as f:
         json.dump(state, f, indent=4)
 
-    print("\nState saved to 'state.json'")
+    print("State saved to 'state.json'")
+    print(json.dumps(state, indent=4))

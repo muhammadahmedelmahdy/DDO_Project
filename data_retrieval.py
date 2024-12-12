@@ -142,6 +142,17 @@ class DataGenerationModule:
         # Return the count of unfulfilled orders
         return len(unfulfilled_orders)
 
+    def get_orders_in_time_window(self, start_time, end_time):
+        start_time = pd.to_datetime(start_time, unit="s")
+        end_time = pd.to_datetime(end_time, unit="s")
+        orders_in_window = self.all_waybill_df[
+            (self.all_waybill_df["dispatch_time"] >= start_time)
+            & (self.all_waybill_df["dispatch_time"] < end_time)
+        ]
+        return orders_in_window[
+            ["order_id", "sender_lat", "sender_lng", "recipient_lat", "recipient_lng"]
+        ]
+
     def construct_state(self, timestamp):
         """
         Construct the RL environment state at the given timestamp.
@@ -196,9 +207,14 @@ if __name__ == "__main__":
     timestamp = 1666077600  # Example timestamp (Unix time)
 
     # Construct state and save to JSON
-    state = data_module.construct_state(timestamp)
-    with open("state.json", "w") as f:
-        json.dump(state, f, indent=4)
+    # state = data_module.construct_state(timestamp)
 
-    print("State saved to 'state.json'")
-    print(json.dumps(state, indent=4))
+    orders_in_window = data_module.get_orders_in_time_window(
+        1666077600, 1666077600 + 3600
+    )
+    print(orders_in_window)
+    # with open("state.json", "w") as f:
+    #     json.dump(state, f, indent=4)
+
+    # print("State saved to 'state.json'")
+    # print(json.dumps(state, indent=4))
